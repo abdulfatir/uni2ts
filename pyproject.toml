@@ -10,7 +10,7 @@ dynamic = [
 dependencies = [
   "torch>=2.0",
   "lightning>=2.0",
-  "gluonts~=0.14.3",
+  "gluonts[pro] @ git+https://github.com/awslabs/gluonts.git@78353021e7644ae53e26dcea1adce2ddef5756aa",
   "numpy~=1.26.0",
   "scipy~=1.11.3",
   "einops==0.7.*",
