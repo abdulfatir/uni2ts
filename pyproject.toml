@@ -73,6 +73,9 @@ path = "src/uni2ts/__about__.py"
 [tool.hatch.build]
 packages = ["src/uni2ts"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.isort]
 profile = "black"
 
