@@ -28,23 +28,46 @@ from uni2ts.common.env import env
 from uni2ts.common.typing import GenFunc
 from uni2ts.data.dataset import EvalDataset, SampleTimeSeriesType, TimeSeriesDataset
 from uni2ts.data.indexer import HuggingFaceDatasetIndexer
-from uni2ts.transform import Identity, Transformation
+from uni2ts.transform import Transformation
 
 from ._base import DatasetBuilder
 
 
 def _from_long_dataframe(
     df: pd.DataFrame,
+    offset: Optional[int] = None,
+    date_offset: Optional[pd.Timestamp] = None,
+    freq: str = "H",
 ) -> tuple[GenFunc, Features]:
     items = df.item_id.unique()
+
+    # Infer the freq and generate the prompt
+    inferred_freq = pd.infer_freq(df.index)
+
+    if inferred_freq is not None:
+        print(
+            f"Inferred frequency: {inferred_freq}. Using this value for the 'freq' parameter."
+        )
+    else:
+        print(
+            f"Inferred frequency is None. Using predefined {freq} for the 'freq' parameter."
+        )
 
     def example_gen_func() -> Generator[dict[str, Any], None, None]:
         for item_id in items:
             item_df = df.query(f'item_id == "{item_id}"').drop("item_id", axis=1)
+            if offset is not None:
+                item_df = item_df.iloc[:offset]
+            elif date_offset is not None:
+                item_df = item_df[item_df.index <= date_offset]
             yield {
                 "target": item_df.to_numpy(),
                 "start": item_df.index[0],
-                "freq": pd.infer_freq(item_df.index),
+                "freq": (
+                    pd.infer_freq(df.index)
+                    if pd.infer_freq(df.index) is not None
+                    else freq
+                ),
                 "item_id": item_id,
             }
 
@@ -62,13 +85,39 @@ def _from_long_dataframe(
 
 def _from_wide_dataframe(
     df: pd.DataFrame,
+    offset: Optional[int] = None,
+    date_offset: Optional[pd.Timestamp] = None,
+    freq: str = "H",
 ) -> tuple[GenFunc, Features]:
+    if offset is not None:
+        df = df.iloc[:offset]
+    elif date_offset is not None:
+        df = df[df.index <= date_offset]
+
+    print(df)
+
+    # Infer the freq and generate the prompt
+    inferred_freq = pd.infer_freq(df.index)
+
+    if inferred_freq is not None:
+        print(
+            f"Inferred frequency: {inferred_freq}. Using this value for the 'freq' parameter."
+        )
+    else:
+        print(
+            f"Inferred frequency is None. Using predefined {freq} for the 'freq' parameter."
+        )
+
     def example_gen_func() -> Generator[dict[str, Any], None, None]:
         for i in range(len(df.columns)):
             yield {
                 "target": df.iloc[:, i].to_numpy(),
                 "start": df.index[0],
-                "freq": pd.infer_freq(df.index),
+                "freq": (
+                    pd.infer_freq(df.index)
+                    if pd.infer_freq(df.index) is not None
+                    else freq
+                ),
                 "item_id": f"item_{i}",
             }
 
@@ -86,12 +135,34 @@ def _from_wide_dataframe(
 
 def _from_wide_dataframe_multivariate(
     df: pd.DataFrame,
+    offset: Optional[int] = None,
+    date_offset: Optional[pd.Timestamp] = None,
+    freq: str = "H",
 ) -> tuple[GenFunc, Features]:
+    if offset is not None:
+        df = df.iloc[:offset]
+    elif date_offset is not None:
+        df = df[df.index <= date_offset]
+
+    # Infer the freq and generate the prompt
+    inferred_freq = pd.infer_freq(df.index)
+
+    if inferred_freq is not None:
+        print(
+            f"Inferred frequency: {inferred_freq}. Using this value for the 'freq' parameter."
+        )
+    else:
+        print(
+            f"Inferred frequency is None. Using predefined {freq} for the 'freq' parameter."
+        )
+
     def example_gen_func() -> Generator[dict[str, Any], None, None]:
         yield {
             "target": df.to_numpy().T,
             "start": df.index[0],
-            "freq": pd.infer_freq(df.index),
+            "freq": (
+                pd.infer_freq(df.index) if pd.infer_freq(df.index) is not None else freq
+            ),
             "item_id": "item_0",
         }
 
@@ -121,8 +192,9 @@ class SimpleDatasetBuilder(DatasetBuilder):
         self,
         file: Path,
         dataset_type: str,
-        offset: int = None,
-        date_offset: pd.Timestamp = None,
+        offset: Optional[int] = None,
+        date_offset: Optional[pd.Timestamp] = None,
+        freq: str = "H",
     ):
         assert offset is None or date_offset is None, (
             "One or neither offset and date_offset must be specified, but not both. "
@@ -131,38 +203,37 @@ class SimpleDatasetBuilder(DatasetBuilder):
 
         df = pd.read_csv(file, index_col=0, parse_dates=True)
 
-        if offset is not None:
-            df = df.iloc[:offset]
-
-        if date_offset is not None:
-            df = df[df.index <= date_offset]
-
         if dataset_type == "long":
-            example_gen_func, features = _from_long_dataframe(df)
+            _from_dataframe = _from_long_dataframe
         elif dataset_type == "wide":
-            example_gen_func, features = _from_wide_dataframe(df)
+            _from_dataframe = _from_wide_dataframe
         elif dataset_type == "wide_multivariate":
-            example_gen_func, features = _from_wide_dataframe_multivariate(df)
+            _from_dataframe = _from_wide_dataframe_multivariate
         else:
             raise ValueError(
                 f"Unrecognized dataset_type, {dataset_type}."
                 " Valid options are 'long', 'wide', and 'wide_multivariate'."
             )
 
+        example_gen_func, features = _from_dataframe(
+            df, freq=freq, offset=offset, date_offset=date_offset
+        )
         hf_dataset = datasets.Dataset.from_generator(
             example_gen_func, features=features
         )
         hf_dataset.info.dataset_name = self.dataset
         hf_dataset.save_to_disk(self.storage_path / self.dataset)
 
-    def load_dataset(self, transform: Transformation = Identity(), *args) -> Dataset:
+    def load_dataset(
+        self, transform_map: dict[str, Callable[..., Transformation]]
+    ) -> Dataset:
         return TimeSeriesDataset(
             HuggingFaceDatasetIndexer(
                 datasets.load_from_disk(
                     str(self.storage_path / self.dataset),
                 )
             ),
-            transform=transform,
+            transform=transform_map[self.dataset](),
             dataset_weight=self.weight,
             sample_time_series=self.sample_time_series,
         )
@@ -182,21 +253,22 @@ class SimpleEvalDatasetBuilder(DatasetBuilder):
     def __post_init__(self):
         self.storage_path = Path(self.storage_path)
 
-    def build_dataset(self, file: Path, dataset_type: str):
+    def build_dataset(self, file: Path, dataset_type: str, freq: str = "H"):
         df = pd.read_csv(file, index_col=0, parse_dates=True)
 
         if dataset_type == "long":
-            example_gen_func, features = _from_long_dataframe(df)
+            _from_dataframe = _from_long_dataframe
         elif dataset_type == "wide":
-            example_gen_func, features = _from_wide_dataframe(df)
+            _from_dataframe = _from_wide_dataframe
         elif dataset_type == "wide_multivariate":
-            example_gen_func, features = _from_wide_dataframe_multivariate(df)
+            _from_dataframe = _from_wide_dataframe_multivariate
         else:
             raise ValueError(
                 f"Unrecognized dataset_type, {dataset_type}."
                 " Valid options are 'long', 'wide', and 'wide_multivariate'."
             )
 
+        example_gen_func, features = _from_dataframe(df, freq=freq)
         hf_dataset = datasets.Dataset.from_generator(
             example_gen_func, features=features
         )
@@ -204,7 +276,7 @@ class SimpleEvalDatasetBuilder(DatasetBuilder):
         hf_dataset.save_to_disk(self.storage_path / self.dataset)
 
     def load_dataset(
-        self, get_transform: Callable[[int, int, int, int, int], Transformation]
+        self, transform_map: dict[str, Callable[..., Transformation]]
     ) -> Dataset:
         return EvalDataset(
             self.windows,
@@ -213,12 +285,12 @@ class SimpleEvalDatasetBuilder(DatasetBuilder):
                     str(self.storage_path / self.dataset),
                 )
             ),
-            transform=get_transform(
-                self.offset,
-                self.distance,
-                self.prediction_length,
-                self.context_length,
-                self.patch_size,
+            transform=transform_map[self.dataset](
+                offset=self.offset,
+                distance=self.distance,
+                prediction_length=self.prediction_length,
+                context_length=self.context_length,
+                patch_size=self.patch_size,
             ),
         )
 
@@ -267,6 +339,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
     )
+    # Define the `freq` argument with a default value. Use this value as 'freq' if 'freq' is None.
+    parser.add_argument(
+        "--freq",
+        default="H",  # Set the default value
+        help="The user specified frequency",
+    )
+
     args = parser.parse_args()
 
     SimpleDatasetBuilder(dataset=args.dataset_name).build_dataset(
@@ -274,6 +353,7 @@ if __name__ == "__main__":
         dataset_type=args.dataset_type,
         offset=args.offset,
         date_offset=pd.Timestamp(args.date_offset) if args.date_offset else None,
+        freq=args.freq,
     )
 
     if args.offset is not None or args.date_offset is not None:
@@ -285,4 +365,6 @@ if __name__ == "__main__":
             prediction_length=None,
             context_length=None,
             patch_size=None,
-        ).build_dataset(file=Path(args.file_path), dataset_type=args.dataset_type)
+        ).build_dataset(
+            file=Path(args.file_path), dataset_type=args.dataset_type, freq=args.freq
+        )

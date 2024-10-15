@@ -14,12 +14,12 @@
 #  limitations under the License.
 
 import abc
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Optional
 
 import torch
 from einops import rearrange
-from jaxtyping import Float, Int, PyTree
+from jaxtyping import Float, PyTree
 from torch import nn
 from torch.distributions import AffineTransform, Distribution, TransformedDistribution
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
@@ -32,6 +32,7 @@ from uni2ts.module.ts_embed import MultiOutSizeLinear
 def tree_map_multi(
     func: Callable, tree: PyTree[Any, "T"], *other: PyTree[Any, "T"]
 ) -> PyTree[Any, "T"]:
+    """Tree map with function requiring multiple inputs, where other inputs are from a PyTree too."""
     leaves, treespec = tree_flatten(tree)
     other_leaves = [tree_flatten(o)[0] for o in other]
     return_leaves = [func(*leaf) for leaf in zip(leaves, *other_leaves)]
@@ -39,6 +40,7 @@ def tree_map_multi(
 
 
 def convert_to_module(tree: PyTree[nn.Module, "T"]) -> PyTree[nn.Module, "T"]:
+    """Convert a simple container PyTree into an nn.Module PyTree"""
     if isinstance(tree, dict):
         return nn.ModuleDict(
             {key: convert_to_module(child) for key, child in tree.items()}
@@ -49,6 +51,7 @@ def convert_to_module(tree: PyTree[nn.Module, "T"]) -> PyTree[nn.Module, "T"]:
 
 
 def convert_to_container(tree: PyTree[nn.Module, "T"]) -> PyTree[nn.Module, "T"]:
+    """Convert an nn.Module PyTree into a simple container PyTree"""
     if isinstance(tree, nn.ModuleDict):
         return {key: convert_to_container(child) for key, child in tree.items()}
     if isinstance(tree, nn.ModuleList):
@@ -57,44 +60,62 @@ def convert_to_container(tree: PyTree[nn.Module, "T"]) -> PyTree[nn.Module, "T"]
 
 
 class DistrParamProj(nn.Module):
+    """
+    Projection layer from representations to distribution parameters.
+    """
+
     def __init__(
         self,
         in_features: int,
-        out_features: int | tuple[int, ...],
+        out_features: int | tuple[int, ...] | list[int],
         args_dim: PyTree[int, "T"],
         domain_map: PyTree[Callable[[torch.Tensor], torch.Tensor], "T"],
         proj_layer: Callable[..., nn.Module] = MultiOutSizeLinear,
         **kwargs: Any,
     ):
+        """
+        :param in_features: size of representation
+        :param out_features: size multiplier of distribution parameters
+        :param args_dim: dimensionality of distribution parameters
+        :param domain_map: mapping for distribution parameters
+        :param proj_layer: projection layer
+        :param kwargs: additional kwargs for proj_layer
+        """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.args_dim = args_dim
         self.domain_map = domain_map
-        self.proj = convert_to_module(
-            tree_map(
-                lambda dim: (
-                    proj_layer(in_features, dim * out_features, **kwargs)
-                    if isinstance(out_features, int)
-                    else proj_layer(
-                        in_features, tuple(dim * of for of in out_features), **kwargs
-                    )
-                ),
-                args_dim,
+
+        if isinstance(out_features, int):
+
+            def proj(dim):
+                proj_layer(in_features, dim * out_features, **kwargs)
+
+        elif isinstance(out_features, Sequence):
+
+            def proj(dim):
+                return proj_layer(
+                    in_features,
+                    tuple(dim * of for of in out_features),
+                    dim=dim,
+                    **kwargs,
+                )
+
+        else:
+            raise ValueError(
+                f"out_features must be int or sequence of ints, got invalid type: {type(out_features)}"
             )
-        )
+
+        self.proj = convert_to_module(tree_map(proj, args_dim))
         self.out_size = (
             out_features if isinstance(out_features, int) else max(out_features)
         )
 
-    def forward(
-        self,
-        x: Float[torch.Tensor, "*batch feat"],
-        out_feat_size: Int[torch.Tensor, "*batch"],
-    ) -> PyTree[Float[torch.Tensor, "*batch out dim"], "T"]:
+    def forward(self, *args) -> PyTree[Float[torch.Tensor, "*batch out dim"], "T"]:
         params_unbounded = tree_map(
             lambda proj: rearrange(
-                proj(x, out_feat_size),
+                proj(*args),
                 "... (dim out_size) -> ... out_size dim",
                 out_size=self.out_size,
             ),
@@ -132,7 +153,12 @@ class AffineTransformed(TransformedDistribution):
 
 
 @abstract_class_property("distr_cls")
-class DistributionOutput(abc.ABC):
+class DistributionOutput:
+    """
+    Base class for distribution outputs.
+    Defines the type of output distribution and provides several helper methods for predictive distributions.
+    """
+
     distr_cls: type[Distribution] = NotImplemented
 
     def distribution(
@@ -156,19 +182,44 @@ class DistributionOutput(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def args_dim(self) -> PyTree[int, "T"]: ...
+    def args_dim(self) -> PyTree[int, "T"]:
+        """
+        Returns the dimensionality of the distribution parameters in the form of a pytree.
+        For simple distributions, this will be a simple dictionary:
+        e.g. for a univariate normal distribution, the args_dim should return {"loc": 1, "scale": 1}.
+        For more complex distributions, this could be an arbitrarily complex pytree.
+
+        :return: pytree of integers representing the dimensionality of the distribution parameters
+        """
+        ...
 
     @property
     @abc.abstractmethod
-    def domain_map(self) -> PyTree[Callable[[torch.Tensor], torch.Tensor], "T"]: ...
+    def domain_map(self) -> PyTree[Callable[[torch.Tensor], torch.Tensor], "T"]:
+        """
+        Returns a pytree of callables that maps the unconstrained distribution parameters
+        to the range required by their distributions.
+
+        :return: callables in the same PyTree format as args_dim
+        """
+        ...
 
     def get_param_proj(
         self,
         in_features: int,
-        out_features: tuple[int, ...],
-        proj_layer: type[nn.Module] = MultiOutSizeLinear,
+        out_features: int | tuple[int, ...] | list[int],
+        proj_layer: Callable[..., nn.Module] = MultiOutSizeLinear,
         **kwargs: Any,
     ) -> nn.Module:
+        """
+        Get a projection layer mapping representations to distribution parameters.
+
+        :param in_features: input feature dimension
+        :param out_features: size multiplier of distribution parameters
+        :param proj_layer: projection layer
+        :param kwargs: additional kwargs for proj_layer
+        :return: distribution parameter projection layer
+        """
         return DistrParamProj(
             in_features=in_features,
             out_features=out_features,

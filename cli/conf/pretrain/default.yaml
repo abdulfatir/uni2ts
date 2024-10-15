@@ -1,14 +1,16 @@
 hydra:
   run:
-    dir: outputs/${hydra:job.name}/${hydra:runtime.choices.model}/${hydra:runtime.choices.data}/${run_name}
+    dir: outputs/pretrain/${hydra:runtime.choices.model}/${hydra:runtime.choices.data}/${run_name}
 defaults:
   - model: ???
   - data: ???
+  - val_data: null
   - _self_
 run_name: ???
 seed: 0
 tf32: true
 compile: false  # set to mode: default, reduce-overhead, max-autotune
+ckpt_path: null  # set to "last" to resume training
 trainer:
   _target_: lightning.Trainer
   accelerator: auto
@@ -37,6 +39,13 @@ trainer:
       mode: max
       save_top_k: -1
       every_n_epochs: ${floordiv:${trainer.max_epochs},10}
+    - _target_: uni2ts.callbacks.HuggingFaceCheckpoint.HuggingFaceCheckpoint
+      dirpath: ${hydra:runtime.output_dir}/HF_checkpoints
+      filename: last
+      monitor: epoch
+      mode: max
+      save_top_k: 1
+      every_n_epochs: 1
   # epoch-based training provides averaged metrics
   # cannot use max_steps with epoch-based training - resume from checkpoint on wrong epoch
   max_epochs: 1_000

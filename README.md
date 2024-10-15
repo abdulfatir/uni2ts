@@ -7,7 +7,11 @@ Uni2TS also provides tools for fine-tuning, inference, and evaluation for time s
 
 ## 🎉 What's New
 
-* Mar 2024: Release of Uni2TS library, along with [Moirai-R](https://huggingface.co/collections/Salesforce/moirai-r-models-65c8d3a94c51428c300e0742) and [LOTSA data](https://huggingface.co/datasets/Salesforce/lotsa_data/)!
+* Jun 2024: Released Moirai-1.1-R model weights in [small](https://huggingface.co/Salesforce/moirai-1.1-R-small), [base](https://huggingface.co/Salesforce/moirai-1.1-R-base), and [large](https://huggingface.co/Salesforce/moirai-1.1-R-large).
+
+* May 2024: The Uni2TS paper has been accepted to ICML 2024 as an Oral presentation!
+
+* Mar 2024: Release of Uni2TS library, along with [Moirai-1.0-R](https://huggingface.co/collections/Salesforce/moirai-10-r-models-65c8d3a94c51428c300e0742) and [LOTSA data](https://huggingface.co/datasets/Salesforce/lotsa_data/)!
 
 ## ✅ TODO
 
@@ -44,6 +48,11 @@ virtualenv venv
 pip install -e '.[notebook]'
 ```
 
+4) Create a `.env` file:
+```shell
+touch .env
+```
+
 ## 🏃 Getting Started
 
 Let's see a simple example on how to use Uni2TS to make zero-shot forecasts from a pre-trained model. 
@@ -52,12 +61,14 @@ Uni2TS relies on GluonTS for inference as it provides many convenience functions
 
 ```python
 import torch
+import matplotlib.pyplot as plt
 import pandas as pd
 from gluonts.dataset.pandas import PandasDataset
 from gluonts.dataset.split import split
 from huggingface_hub import hf_hub_download
 
-from uni2ts.model.moirai import MoiraiForecast
+from uni2ts.eval_util.plot import plot_single
+from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
 
 
 SIZE = "small"  # model size: choose from {'small', 'base', 'large'}
@@ -88,15 +99,10 @@ test_data = test_template.generate_instances(
     windows=TEST // PDT,  # number of windows in rolling window evaluation
     distance=PDT,  # number of time steps between each window - distance=PDT for non-overlapping windows
 )
-```
 
-Now that we have loaded our data, we prepare our pre-trained model by downloading model weights from [Hugging Face Hub](https://huggingface.co/collections/Salesforce/moirai-r-models-65c8d3a94c51428c300e0742)
-
-```python
-model = MoiraiForecast.load_from_checkpoint(
-    checkpoint_path=hf_hub_download(
-        repo_id=f"Salesforce/moirai-R-{SIZE}", filename="model.ckpt"
-    ),
+# Prepare pre-trained model by downloading model weights from huggingface hub
+model = MoiraiForecast(
+    module=MoiraiModule.from_pretrained(f"Salesforce/moirai-1.0-R-{SIZE}"),
     prediction_length=PDT,
     context_length=CTX,
     patch_size=PSZ,
@@ -104,7 +110,6 @@ model = MoiraiForecast.load_from_checkpoint(
     target_dim=1,
     feat_dynamic_real_dim=ds.num_feat_dynamic_real,
     past_feat_dynamic_real_dim=ds.num_past_feat_dynamic_real,
-    map_location="cuda:0" if torch.cuda.is_available() else "cpu",
 )
 
 predictor = model.create_predictor(batch_size=BSZ)
@@ -117,7 +122,20 @@ forecast_it = iter(forecasts)
 inp = next(input_it)
 label = next(label_it)
 forecast = next(forecast_it)
+
+plot_single(
+    inp, 
+    label, 
+    forecast, 
+    context_length=200,
+    name="pred",
+    show_label=True,
+)
+plt.show()
 ```
+
+## 📔 Jupyter Notebook Examples
+See the [example folder](example) for more examples on common tasks, e.g. visualizing forecasts, predicting from pandas DataFrame, etc.
 
 ## 💻 Command Line Interface
 We provide several scripts which act as a [command line interface](cli) to easily run fine-tuning, evaluation, and even pre-training jobs. 
@@ -132,7 +150,6 @@ For more complex use cases, see [this notebook](example/prepare_data.ipynb) for 
 
 1. To begin the process, add the path to the directory where you want to save the processed dataset into the ```.env``` file.
 ```shell
-touch .env
 echo "CUSTOM_DATA_PATH=PATH_TO_SAVE" >> .env
 ```
 
@@ -150,9 +167,10 @@ python -m uni2ts.data.builder.simple ETTh1 dataset/ETT-small/ETTh1.csv --date_of
 
 3. Finally, we can simply run the fine-tuning script with the appropriate [training](cli/conf/finetune/data/etth1.yaml) and [validation](cli/conf/finetune/val_data/etth1.yaml) data configuration files.
 ```shell
-python -m cli.finetune \
+python -m cli.train \
+  -cp conf/finetune \
   run_name=example_run \ 
-  model=moirai_R_small \ 
+  model=moirai_1.0_R_small \ 
   data=etth1 \ 
   val_data=etth1  
 ```
@@ -161,13 +179,14 @@ python -m cli.finetune \
 
 The evaluation script can be used to calculate evaluation metrics such as MSE, MASE, CRPS, and so on (see the [configuration file](cli/conf/eval/default.yaml)). 
 
-Following up on the fine-tuning example, we can now perform evaluation on the test split by running the following script:
+Given a test split (see previous section on processing datasets), we can run the following command to evaluate it:
 ```shell
 python -m cli.eval \ 
-  data=etth1_test \ 
-  patch_size=32 \ 
-  context_length=1000 \ 
-  checkpoint_path=moirai_R_small
+  run_name=example_eval_1 \
+  model=moirai_1.0_R_small \
+  model.patch_size=32 \ 
+  model.context_length=1000 \
+  data=etth1_test
 ```
 
 Alternatively, we provide access to popular datasets, and can be toggled via the [data configurations](cli/conf/eval/data).
@@ -181,12 +200,13 @@ echo "LSF_PATH=PATH_TO_TSLIB/dataset" >> .env
 Thereafter, simply run the following script with the predefined [Hydra config file](cli/conf/eval/data/lsf_test.yaml):
 ```shell
 python -m cli.eval \ 
+  run_name=example_eval_2 \
+  model=moirai_1.0_R_small \
+  model.patch_size=32 \ 
+  model.context_length=1000 \ 
   data=lsf_test \
   data.dataset_name=ETTh1 \
-  data.prediction_length=96 \ 
-  patch_size=32 \ 
-  context_length=1000 \ 
-  checkpoint_path=moirai_R_small
+  data.prediction_length=96 
 ```
 
 ### Pre-training
@@ -199,16 +219,14 @@ echo "LOTSA_V1_PATH=PATH_TO_SAVE" >> .env
 ```
 
 Then, we can simply run the following script to start a pre-training job. 
-See the [relevant](cli/pretrain.py) [files](cli/conf/pretrain) on how to further customize the settings.
+See the [relevant](cli/train.py) [files](cli/conf/pretrain) on how to further customize the settings.
 ```shell
-python -m cli.pretrain \
+python -m cli.train \
+  -cp conf/pretrain \
   run_name=first_run \
   model=moirai_small \
   data=lotsa_v1_unweighted
 ```
-
-## 📔 Jupyter Notebook Examples
-See the [example folder](example) for more examples on common tasks, e.g. visualizing forecasts, predicting from pandas DataFrame, etc.
 
 ## 👀 Citing Uni2TS
 

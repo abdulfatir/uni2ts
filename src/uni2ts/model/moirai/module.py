@@ -17,9 +17,12 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
+from huggingface_hub import PyTorchModelHubMixin
+from hydra.utils import instantiate
 from jaxtyping import Bool, Float, Int
 from torch import nn
 from torch.distributions import Distribution
+from torch.utils._pytree import tree_map
 
 from uni2ts.common.torch_util import mask_fill, packed_attention_mask
 from uni2ts.distribution import DistributionOutput
@@ -34,20 +37,59 @@ from uni2ts.module.transformer import TransformerEncoder
 from uni2ts.module.ts_embed import MultiInSizeLinear
 
 
-class MoiraiModule(nn.Module):
-    """Contains components of Moirai to ensure implementation is identical across models"""
+def encode_distr_output(
+    distr_output: DistributionOutput,
+) -> dict[str, str | float | int]:
+    """Serialization function for DistributionOutput"""
+
+    def _encode(val):
+        if not isinstance(val, DistributionOutput):
+            return val
+
+        return {
+            "_target_": f"{val.__class__.__module__}.{val.__class__.__name__}",
+            **tree_map(_encode, val.__dict__),
+        }
+
+    return _encode(distr_output)
+
+
+def decode_distr_output(config: dict[str, str | float | int]) -> DistributionOutput:
+    """Deserialization function for DistributionOutput"""
+    return instantiate(config, _convert_="all")
+
+
+class MoiraiModule(
+    nn.Module,
+    PyTorchModelHubMixin,
+    coders={DistributionOutput: (encode_distr_output, decode_distr_output)},
+):
+    """
+    Contains components of Moirai, to ensure implementation is identical across models.
+    Subclasses huggingface_hub.PyTorchModelHubMixin to support loading from HuggingFace Hub.
+    """
 
     def __init__(
         self,
         distr_output: DistributionOutput,
         d_model: int,
         num_layers: int,
-        patch_sizes: tuple[int, ...],
+        patch_sizes: tuple[int, ...],  # tuple[int, ...] | list[int]
         max_seq_len: int,
         attn_dropout_p: float,
         dropout_p: float,
         scaling: bool = True,
     ):
+        """
+        :param distr_output: distribution output object
+        :param d_model: model hidden dimensions
+        :param num_layers: number of transformer layers
+        :param patch_sizes: sequence of patch sizes
+        :param max_seq_len: maximum sequence length for inputs
+        :param attn_dropout_p: dropout probability for attention layers
+        :param dropout_p: dropout probability for all other layers
+        :param scaling: whether to apply scaling (standardization)
+        """
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
@@ -96,6 +138,26 @@ class MoiraiModule(nn.Module):
         prediction_mask: Bool[torch.Tensor, "*batch seq_len"],
         patch_size: Int[torch.Tensor, "*batch seq_len"],
     ) -> Distribution:
+        """
+        Defines the forward pass of MoiraiModule.
+        This method expects processed inputs.
+
+        1. Apply scaling to observations
+        2. Project from observations to representations
+        3. Replace prediction window with learnable mask
+        4. Apply transformer layers
+        5. Project from representations to distribution parameters
+        6. Return distribution object
+
+        :param target: input data
+        :param observed_mask: binary mask for missing values, 1 if observed, 0 otherwise
+        :param sample_id: indices indicating the sample index (for packing)
+        :param time_id: indices indicating the time index
+        :param variate_id: indices indicating the variate index
+        :param prediction_mask: binary mask for prediction horizon, 1 if part of the horizon, 0 otherwise
+        :param patch_size: patch size for each token
+        :return: predictive distribution
+        """
         loc, scale = self.scaler(
             target,
             observed_mask * ~prediction_mask.unsqueeze(-1),
